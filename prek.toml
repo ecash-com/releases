@@ -1,0 +1,34 @@
+# Pre-commit hooks, run via prek (https://prek.j178.dev). Formatters write
+# in place; a commit whose files were rewritten aborts so the result can be
+# restaged.
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "oxfmt"
+name = "oxfmt"
+entry = "oxfmt"
+language = "system"
+types_or = ["markdown", "yaml", "json", "toml"]
+
+[[repos.hooks]]
+id = "shfmt"
+name = "shfmt"
+entry = "shfmt --write"
+language = "system"
+types = ["shell"]
+
+[[repos.hooks]]
+id = "shellcheck"
+name = "shellcheck"
+entry = "shellcheck"
+language = "system"
+types = ["shell"]
+
+[[repos.hooks]]
+id = "actionlint"
+name = "actionlint"
+entry = "actionlint"
+language = "system"
+files = "^\\.github/workflows/.*\\.ya?ml$"
+pass_filenames = false
