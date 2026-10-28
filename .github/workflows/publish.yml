@@ -25,6 +25,20 @@ on:
         description: Newline-separated target triples; the order of files in release.json.
         required: true
         type: string
+      release-id:
+        description:
+          Name of the immutable directory under <project>/<channel>/. Defaults to the 12-character
+          commit; tagged releases pass their version. A name is never reused with different content.
+        required: false
+        type: string
+        default: ""
+      zip-naming:
+        description:
+          "plain: <project>-<target>.zip. versioned: <project>-<version>-<target>.zip, with a stable
+          <project>-latest-<target>.zip in latest/."
+        required: false
+        type: string
+        default: plain
       environment:
         description: Caller's deployment environment holding the R2 secrets.
         required: false
@@ -49,6 +63,8 @@ on:
         value: ${{ jobs.publish.outputs.version }}
       commit-short:
         value: ${{ jobs.publish.outputs.commit-short }}
+      release-id:
+        value: ${{ jobs.publish.outputs.release-id }}
       release-url:
         value: ${{ jobs.publish.outputs.release-url }}
 
@@ -80,6 +96,7 @@ jobs:
     outputs:
       version: ${{ steps.assemble.outputs.version }}
       commit-short: ${{ steps.assemble.outputs.short }}
+      release-id: ${{ steps.assemble.outputs.release-id }}
       release-url: ${{ steps.assemble.outputs.release-url }}
 
     env:
@@ -87,7 +104,11 @@ jobs:
       CHANNEL: ${{ inputs.channel }}
       TARGETS: ${{ inputs.targets }}
       BASE_URL: ${{ inputs.base-url }}
+      RELEASE_ID: ${{ inputs.release-id }}
+      ZIP_NAMING: ${{ inputs.zip-naming }}
       COMMIT: ${{ github.sha }}
+      # Recorded in release.json; consumers verify against it.
+      SOURCE_REF: ${{ github.ref }}
       SOURCE_REPO: ${{ github.repository }}
       # This file's own path; no context variable exposes it to a called workflow.
       SIGNER_WORKFLOW: ecash-com/releases/.github/workflows/publish.yml
@@ -109,6 +130,10 @@ jobs:
 
           is_safe_path_component "$PROJECT" || die "project '$PROJECT' is not a safe path component"
           is_safe_path_component "$CHANNEL" || die "channel '$CHANNEL' is not a safe path component"
+          [ -z "$RELEASE_ID" ] || is_safe_path_component "$RELEASE_ID" \
+            || die "release-id '$RELEASE_ID' is not a safe path component"
+          [ "$ZIP_NAMING" = plain ] || [ "$ZIP_NAMING" = versioned ] \
+            || die "zip-naming '$ZIP_NAMING' must be 'plain' or 'versioned'"
           [ -n "$(printf '%s' "$TARGETS" | tr -d '[:space:]')" ] || die "targets is empty"
 
           [ "$EVENT_NAME" = "push" ] || echo "::notice::Publishing from a '$EVENT_NAME' event"
@@ -129,7 +154,9 @@ jobs:
 
           export TZ=UTC # zip stores local-time DOS timestamps
           commit_short="${COMMIT:0:12}"
+          release_id="${RELEASE_ID:-$commit_short}"
           mkdir -p release staging
+          : > zips.tsv # "<target>\t<zip name>" per bundle, kept outside release/
 
           artifact_for_target() {
             local target="$1" matches
@@ -166,21 +193,33 @@ jobs:
             (cd staging && find "$dir" | LC_ALL=C sort | zip -q -X "../release/$zip" -@)
           }
 
+          zip_name() {
+            local version="$1" target="$2"
+            if [ "$ZIP_NAMING" = versioned ]; then
+              echo "${PROJECT}-${version}-${target}.zip"
+            else
+              echo "${PROJECT}-${target}.zip"
+            fi
+          }
+
           write_manifest() {
-            local version="$1" files
+            local version="$1" files target
             cd release
             sha256sum ./*.zip | sed 's| \./| |' > SHA256SUMS
             files=$(for f in *.zip; do
-              jq -n --arg name "$f" \
+              target=$(awk -F'\t' -v name="$f" '$2 == name { print $1 }' ../zips.tsv)
+              jq -n --arg name "$f" --arg target "$target" \
                     --arg sha256 "$(sha256sum "$f" | cut -d' ' -f1)" \
                     --argjson size "$(stat -c %s "$f")" \
-                    '{name: $name, sha256: $sha256, size: $size}'
+                    '{name: $name, target: $target, sha256: $sha256, size: $size}'
             done | jq -s .)
             jq -n --arg version "$version" --arg commit "$COMMIT" --arg short "$commit_short" \
-                  --arg repo "$SOURCE_REPO" --arg path "${PROJECT}/${CHANNEL}/${commit_short}/" \
+                  --arg repo "$SOURCE_REPO" --arg ref "$SOURCE_REF" --arg channel "$CHANNEL" \
+                  --arg path "${PROJECT}/${CHANNEL}/${release_id}/" \
                   --argjson files "$files" \
                   '{version: $version, commit: $commit, commit_short: $short,
-                    repository: $repo, path: $path, files: $files}' > release.json
+                    repository: $repo, ref: $ref, channel: $channel, path: $path,
+                    files: $files}' > release.json
             cd ..
           }
 
@@ -194,8 +233,10 @@ jobs:
               || die "version mismatch: '$version' vs '$target_version' (${target})"
             bundle="${PROJECT}-${version}-${commit_short}-${target}"
             stage "$artifact" "$bundle"
-            zip_deterministic "$bundle" "${PROJECT}-${target}.zip"
-            echo "bundled ${target} -> ${PROJECT}-${target}.zip"
+            zip=$(zip_name "$version" "$target")
+            zip_deterministic "$bundle" "$zip"
+            printf '%s\t%s\n' "$target" "$zip" >> zips.tsv
+            echo "bundled ${target} -> ${zip}"
           done <<< "$TARGETS"
 
           write_manifest "$version"
@@ -203,7 +244,8 @@ jobs:
           {
             echo "version=$version"
             echo "short=$commit_short"
-            echo "release-url=${BASE_URL}/${PROJECT}/${CHANNEL}/${commit_short}/release.json"
+            echo "release-id=$release_id"
+            echo "release-url=${BASE_URL}/${PROJECT}/${CHANNEL}/${release_id}/release.json"
           } >> "$GITHUB_OUTPUT"
 
           ls -l release
@@ -233,12 +275,12 @@ jobs:
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
           BUCKET: ${{ secrets.R2_BUCKET }}
-          SHORT: ${{ steps.assemble.outputs.short }}
+          RELEASE_DIR: ${{ steps.assemble.outputs.release-id }}
         run: |
           set -euo pipefail
           die() { echo "::error::$*" >&2; exit 1; }
 
-          immutable_prefix="${PROJECT}/${CHANNEL}/${SHORT}"
+          immutable_prefix="${PROJECT}/${CHANNEL}/${RELEASE_DIR}"
           latest_prefix="${PROJECT}/${CHANNEL}/latest"
 
           require_aws_cli() {
@@ -292,17 +334,19 @@ jobs:
           }
 
           # Server-side copy, run last so latest/ never names a half-published release.
+          # The copy keeps its name unless a different one is given.
           move_pointer() {
-            local file="$1" name
+            local file="$1" name as
             name=$(basename "$file")
+            as="${2:-$name}"
             aws s3api copy-object --bucket "$BUCKET" \
-              --key "$latest_prefix/$name" \
+              --key "$latest_prefix/$as" \
               --copy-source "$BUCKET/$immutable_prefix/$name" \
               --metadata-directive REPLACE \
               --content-type "$(content_type "$file")" \
               --cache-control 'public, max-age=60, must-revalidate' \
               --metadata "sha256=$(published_sha256 "$immutable_prefix/$name"),commit=$COMMIT" >/dev/null
-            echo "  copy   $latest_prefix/$name"
+            echo "  copy   $latest_prefix/$as"
           }
 
           require_aws_cli
@@ -314,16 +358,25 @@ jobs:
 
           echo "Updating s3://$BUCKET/$latest_prefix/"
           for file in release/*; do
+            # Versioned zips would pile up in latest/; it gets the stable names below.
+            if [ "$ZIP_NAMING" = versioned ] && [ "${file##*.}" = zip ]; then
+              continue
+            fi
             move_pointer "$file"
           done
+          if [ "$ZIP_NAMING" = versioned ]; then
+            while IFS=$'\t' read -r target zip; do
+              move_pointer "release/$zip" "${PROJECT}-latest-${target}.zip"
+            done < zips.tsv
+          fi
 
       - name: Summary
         env:
           VERSION: ${{ steps.assemble.outputs.version }}
-          SHORT: ${{ steps.assemble.outputs.short }}
+          RELEASE_DIR: ${{ steps.assemble.outputs.release-id }}
         run: |
           set -euo pipefail
-          release_url="$BASE_URL/$PROJECT/$CHANNEL/$SHORT"
+          release_url="$BASE_URL/$PROJECT/$CHANNEL/$RELEASE_DIR"
           {
             echo "### Published to ${BASE_URL#https://}"
             echo
@@ -348,8 +401,8 @@ jobs:
             echo
             echo '```sh'
             echo "curl -fsSLO $release_url/provenance.jsonl"
-            echo "gh attestation verify ${PROJECT}-<target>.zip --bundle provenance.jsonl \\"
+            echo "gh attestation verify <zip> --bundle provenance.jsonl \\"
             echo "  --repo $SOURCE_REPO --signer-workflow $SIGNER_WORKFLOW \\"
-            echo "  --source-ref refs/heads/$CHANNEL --source-digest $COMMIT --deny-self-hosted-runners"
+            echo "  --source-ref $SOURCE_REF --source-digest $COMMIT --deny-self-hosted-runners"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

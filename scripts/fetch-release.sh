@@ -12,12 +12,14 @@ Usage: $(basename "$0") PROJECT REPO CHANNEL TARGET DEST_DIR
 
   PROJECT   top-level prefix on the server, e.g. L1-ecash-bitcoin
   REPO      GitHub repository the build came from, e.g. ecash-com/bitcoin
-  CHANNEL   published branch, e.g. betanet
+  CHANNEL   published channel, e.g. betanet or nightly
   TARGET    target triple, e.g. x86_64-unknown-linux-gnu
   DEST_DIR  where the unpacked directory ends up
 
 Environment: RELEASES_URL (default $RELEASES_URL)
              SIGNER_WORKFLOW (default $SIGNER_WORKFLOW)
+             EXPECT_REF  refuse a build not made from this ref, e.g. refs/tags/0.19.0
+                         or refs/heads/master (default: trust the ref release.json records)
 EOF
     exit 2
 }
@@ -51,13 +53,13 @@ sha256() {
     if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
 }
 
-# Verifies that $1 was attested by SIGNER_WORKFLOW, run for REPO on CHANNEL at COMMIT.
+# Verifies that $1 was attested by SIGNER_WORKFLOW, run for REPO on SOURCE_REF at COMMIT.
 verify_provenance() {
     gh attestation verify "$1" \
         --bundle "$TMP/provenance.jsonl" \
         --repo "$REPO" \
         --signer-workflow "$SIGNER_WORKFLOW" \
-        --source-ref "refs/heads/$CHANNEL" \
+        --source-ref "$SOURCE_REF" \
         --source-digest "$COMMIT" \
         --deny-self-hosted-runners
 }
@@ -71,7 +73,6 @@ case "$REPO" in */*) ;; *) die "invalid REPO '$REPO': expected owner/name" ;; es
 require_tools
 
 CHANNEL_URL="$RELEASES_URL/$PROJECT/$CHANNEL"
-ZIP_NAME="$PROJECT-$TARGET.zip"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -82,10 +83,26 @@ curl -fsSL "$CHANNEL_URL/latest/release.json" -o "$TMP/release.json" \
 COMMIT="$(jq -er '.commit' "$TMP/release.json")"
 VERSION="$(jq -er '.version' "$TMP/release.json")"
 RELEASE_PATH="$(jq -er '.path' "$TMP/release.json")"
+# Manifests list each zip with its target. Older ones don't, and name the zip
+# <project>-<target>.zip.
+ZIP_NAME="$(jq -er --arg target "$TARGET" --arg legacy "$PROJECT-$TARGET.zip" \
+    '.files | (map(select(.target == $target))[0].name) // (map(select(.name == $legacy))[0].name)' \
+    "$TMP/release.json")" \
+    || die "$CHANNEL@${COMMIT:0:12} publishes nothing for $TARGET"
+is_safe_path_component "$ZIP_NAME" || die "release.json: bad file name '$ZIP_NAME'"
 EXPECTED_SHA256="$(jq -er --arg name "$ZIP_NAME" \
     '.files[] | select(.name == $name) | .sha256' "$TMP/release.json")" \
-    || die "$CHANNEL@${COMMIT:0:12} publishes no $ZIP_NAME"
+    || die "$CHANNEL@${COMMIT:0:12} lists no sha256 for $ZIP_NAME"
 case "$COMMIT" in *[!0-9a-f]* | '') die "release.json: bad commit '$COMMIT'" ;; esac
+# Where the build ran. Manifests from tag builds that predate `ref` carry only
+# `tag`; older ones were branch builds named after their channel. The ref is
+# checked against the attestation below, so a wrong claim fails verification.
+SOURCE_REF="$(jq -er --arg channel "$CHANNEL" \
+    '.ref // (if .tag then "refs/tags/" + .tag else "refs/heads/" + $channel end)' \
+    "$TMP/release.json")"
+case "$SOURCE_REF" in refs/heads/* | refs/tags/*) ;; *) die "release.json: bad ref '$SOURCE_REF'" ;; esac
+[ -z "${EXPECT_REF:-}" ] || [ "$SOURCE_REF" = "$EXPECT_REF" ] \
+    || die "$CHANNEL@${COMMIT:0:12} was built from $SOURCE_REF, expected $EXPECT_REF"
 case "$RELEASE_PATH" in "$PROJECT/$CHANNEL/"*) ;; *) die "release.json: path '$RELEASE_PATH' is outside $PROJECT/$CHANNEL/" ;; esac
 RELEASE_URL="$RELEASES_URL/${RELEASE_PATH%/}"
 
